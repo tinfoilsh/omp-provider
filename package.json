@@ -1,0 +1,60 @@
+{
+	"name": "@tinfoilsh/omp-provider",
+	"version": "0.1.0",
+	"description": "Verifiably-private models from Tinfoil secure enclaves, for the omp coding agent",
+	"type": "module",
+	"license": "Apache-2.0",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/tinfoilsh/omp-provider.git"
+	},
+	"homepage": "https://tinfoil.sh/coding-agents",
+	"bugs": {
+		"url": "https://github.com/tinfoilsh/omp-provider/issues"
+	},
+	"keywords": [
+		"omp",
+		"oh-my-pi",
+		"omp-plugin",
+		"tinfoil",
+		"provider",
+		"privacy",
+		"confidential-computing",
+		"attestation"
+	],
+	"omp": {
+		"extensions": [
+			"./tinfoil.ts"
+		]
+	},
+	"peerDependencies": {
+		"@oh-my-pi/pi-ai": "^18",
+		"@oh-my-pi/pi-catalog": "^18",
+		"@oh-my-pi/pi-coding-agent": "^18"
+	},
+	"files": [
+		"tinfoil.ts",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"build": "echo 'nothing to build'",
+		"check": "tsc --noEmit"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"dependencies": {
+		"tinfoil": "^1.2.1"
+	},
+	"devDependencies": {
+		"@oh-my-pi/pi-ai": "18.2.1",
+		"@oh-my-pi/pi-catalog": "^18.2.1",
+		"@oh-my-pi/pi-coding-agent": "18.2.1",
+		"@types/node": "^24.0.0",
+		"typescript": "^5.9.0"
+	},
+	"engines": {
+		"omp": ">=18"
+	}
+}
