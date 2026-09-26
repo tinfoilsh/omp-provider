@@ -1,11 +1,12 @@
-import {
-	type Api,
-	type AssistantMessageEventStream,
-	type Context,
-	type Model,
-	type SimpleStreamOptions,
-	streamOpenAICompletions,
+import type {
+	Api,
+	AssistantMessageEventStream,
+	Context,
+	Model,
+	SimpleStreamOptions,
 } from "@oh-my-pi/pi-ai";
+// Provider runtime APIs live on providers/* subpaths since pi-ai 18.2.7; the root re-exports them as types only.
+import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { ExtensionAPI, ProviderModelConfig } from "@oh-my-pi/pi-coding-agent";
 // Resolves from this package's node_modules: omp does not rewrite this specifier.
