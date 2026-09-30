@@ -7,7 +7,9 @@ import type {
 } from "@oh-my-pi/pi-ai";
 // Provider runtime APIs live on providers/* subpaths since pi-ai 18.2.7; the root re-exports them as types only.
 import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
-import { buildModel } from "@oh-my-pi/pi-catalog/build";
+// omp's compiled host bundle omits pi-catalog/build (a plugin import of it falls back to an
+// on-disk copy that cannot load); config/model-patch is bundled and rebuilds via buildModel.
+import { applyModelPatch } from "@oh-my-pi/pi-coding-agent/config/model-patch";
 import type { ExtensionAPI, ProviderModelConfig } from "@oh-my-pi/pi-coding-agent";
 // Resolves from this package's node_modules: omp does not rewrite this specifier.
 import { SecureClient, type VerificationDocument } from "tinfoil";
@@ -468,25 +470,20 @@ export default function (pi: ExtensionAPI) {
 	 * under the real id reuses that resolution instead of hand-maintaining ~60 fields.
 	 */
 	const asCompletionsModel = (model: Model<Api>): Model<"openai-completions"> => {
-		// Drop the fields buildModel derives, so this is a spec and not a built model.
+		// Drop the fields buildModel derives, so they are re-derived for the real id. applyModelPatch's
+		// toModelSpec already drops `compat` and `supportsComputerUseConfig` and keeps `compatConfig`.
 		const {
-			compat: _compat,
 			identity: _identity,
-			compatConfig,
 			requiresGlyphTokenization: _glyph,
 			requiresCursorToolSchemaProjection: _cursor,
 			requiresToolResultImageHoisting: _hoist,
 			supportsAssistantPrefill: _prefill,
-			supportsComputerUseConfig: _computer,
 			...spec
 		} = model;
 
 		// Uncached: keying by id would pin the first build past a discovery refresh.
-		return buildModel({
-			...spec,
-			api: "openai-completions",
-			compat: compatConfig,
-		} as Parameters<typeof buildModel<"openai-completions">>[0]);
+		// An empty patch just rebuilds the model under the real api id.
+		return applyModelPatch({ ...spec, api: "openai-completions" } as Model<Api>, {}, "merge") as Model<"openai-completions">;
 	};
 
 	/**
