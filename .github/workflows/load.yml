@@ -121,6 +121,12 @@ jobs:
       # should be able to spend money or reach an enclave with real credentials.
       TINFOIL_API_KEY: tk_not_a_real_key_models_only
     steps:
+      # `omp plugin install <package>` shells out to bun to fetch from the
+      # registry, and a GitHub runner has no bun. The tree legs do not need it:
+      # a directory argument links what npm already installed.
+      - name: Set up bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
       - name: Install omp (latest)
         run: |
           base=https://github.com/can1357/oh-my-pi/releases/latest/download
