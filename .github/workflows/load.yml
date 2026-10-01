@@ -1,0 +1,188 @@
+# Does the plugin still load in omp?
+#
+# ci.yml typechecks, which resolves imports against node_modules where they all
+# exist. omp's compiled binary resolves an extension's `@oh-my-pi/*` imports to
+# copies bundled inside itself, and only for a fixed list of paths, so an import
+# that typechecks can still fail to load. That broke installs twice (#1, #4),
+# both reported by a user, and both without this repo changing: omp shipped a
+# release and the published plugin stopped loading. omp releases roughly every
+# 14 hours, hence the schedule.
+name: Load test
+
+on:
+  schedule:
+    - cron: "0 1,13 * * *"
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions: {}
+concurrency:
+  group: load-${{ github.workflow }}-${{ github.ref }}
+  # Superseding a pull request run is fine; cancelling the scheduled run would
+  # throw away the one whose failure opens an issue.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # What we are about to ship, against the newest omp and the oldest we support.
+  tree:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - omp: latest
+            url: https://github.com/can1357/oh-my-pi/releases/latest/download/omp-linux-x64
+            sums: https://github.com/can1357/oh-my-pi/releases/latest/download/SHA256SUMS.txt
+          - omp: floor
+            # The version the devDependencies pin, so a fix for the newest omp
+            # cannot quietly drop support for it.
+            url: https://github.com/can1357/oh-my-pi/releases/download/v18.4.2/omp-linux-x64
+            sums: https://github.com/can1357/oh-my-pi/releases/download/v18.4.2/SHA256SUMS.txt
+    name: tree (omp ${{ matrix.omp }})
+    timeout-minutes: 15
+    env:
+      # Models are only offered when a key is present. Deliberately not a real
+      # one: listing models makes no API call, and nothing in this workflow
+      # should be able to spend money or reach an enclave with real credentials.
+      TINFOIL_API_KEY: tk_not_a_real_key_models_only
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      # Through env rather than inline interpolation, so the URL can never be
+      # expanded into the shell command itself.
+      - name: Install omp (${{ matrix.omp }})
+        env:
+          OMP_URL: ${{ matrix.url }}
+          SUMS_URL: ${{ matrix.sums }}
+        run: |
+          curl -fsSL "$OMP_URL" -o "$RUNNER_TEMP/omp"
+          # This binary is third-party code that the next steps execute. The
+          # checksum does not make upstream trustworthy, but it does mean the
+          # job runs exactly what upstream published for this release.
+          curl -fsSL "$SUMS_URL" -o "$RUNNER_TEMP/SHA256SUMS.txt"
+          expected="$(awk '$2 == "omp-linux-x64" { print $1 }' "$RUNNER_TEMP/SHA256SUMS.txt")"
+          actual="$(sha256sum "$RUNNER_TEMP/omp" | cut -d" " -f1)"
+          if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+            echo "omp checksum mismatch: expected '$expected', got '$actual'" >&2
+            exit 1
+          fi
+          chmod +x "$RUNNER_TEMP/omp"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Report the omp version
+        run: omp --version | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Needed before linking: the failure happens when omp falls back to the
+      # extension's own node_modules copy of a host package, so the test is only
+      # faithful with dependencies installed.
+      #
+      # --ignore-scripts: three transitive dev dependencies declare install
+      # scripts, and nothing here needs them — the typecheck wants type
+      # declarations and omp wants sources.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      # A directory argument links rather than installing from the registry,
+      # which is the only way to test unreleased code. It reaches the same
+      # loader: a broken import fails here exactly as it does after an install.
+      - name: Link the working tree as a plugin
+        run: omp plugin install "$GITHUB_WORKSPACE"
+
+      # This is the assertion, not the step above. Linking reports success even
+      # when the extension cannot load; only loading it shows that up.
+      - name: The provider loads and lists models
+        run: |
+          out=$(omp models tinfoil 2>&1 || true)
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -qE 'tinfoil \([1-9][0-9]*\)'
+
+  # What users actually have. Between a fix landing on main and a release, this
+  # is the only leg that still reports the break they are hitting.
+  published:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    name: published (omp latest)
+    timeout-minutes: 15
+    env:
+      # Models are only offered when a key is present. Deliberately not a real
+      # one: listing models makes no API call, and nothing in this workflow
+      # should be able to spend money or reach an enclave with real credentials.
+      TINFOIL_API_KEY: tk_not_a_real_key_models_only
+    steps:
+      - name: Install omp (latest)
+        run: |
+          base=https://github.com/can1357/oh-my-pi/releases/latest/download
+          curl -fsSL "$base/omp-linux-x64" -o "$RUNNER_TEMP/omp"
+          curl -fsSL "$base/SHA256SUMS.txt" -o "$RUNNER_TEMP/SHA256SUMS.txt"
+          expected="$(awk '$2 == "omp-linux-x64" { print $1 }' "$RUNNER_TEMP/SHA256SUMS.txt")"
+          actual="$(sha256sum "$RUNNER_TEMP/omp" | cut -d" " -f1)"
+          if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+            echo "omp checksum mismatch: expected '$expected', got '$actual'" >&2
+            exit 1
+          fi
+          chmod +x "$RUNNER_TEMP/omp"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Report the omp version
+        run: omp --version | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Install the published plugin
+        run: omp plugin install @tinfoilsh/omp-provider
+
+      - name: The provider loads and lists models
+        run: |
+          out=$(omp models tinfoil 2>&1 || true)
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -qE 'tinfoil \([1-9][0-9]*\)'
+
+  # A scheduled failure has to reach a person. A new issue emails repo watchers;
+  # a continuing failure comments rather than opening another one.
+  report:
+    name: report a scheduled failure
+    needs:
+      - tree
+      - published
+    if: |
+      always() &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+      (needs.tree.result == 'failure' || needs.published.result == 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write # open or comment on the issue announcing the break
+    steps:
+      - name: Open or update the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TREE: ${{ needs.tree.result }}
+          PUBLISHED: ${{ needs.published.result }}
+        run: |
+          title="Load test failing: the plugin does not load in omp"
+          body=$(printf '%s\n' \
+            "The scheduled load test failed, which usually means omp shipped a release that changed how it resolves an extension's imports." \
+            "" \
+            "- working tree: \`$TREE\`" \
+            "- published package: \`$PUBLISHED\`" \
+            "- run: $RUN_URL" \
+            "" \
+            "If only the published leg failed, a fix is on main but not released yet.")
+          existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
