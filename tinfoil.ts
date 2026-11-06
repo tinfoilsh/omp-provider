@@ -203,6 +203,14 @@ const FALLBACK_CATALOG: TinfoilApiModel[] = [
 		pricing: { inputTokenPricePer1M: 0.65, outputTokenPricePer1M: 1.45 },
 	},
 	{
+		id: "kimi-k3-1-pro",
+		name: "Kimi K3.1 Pro",
+		context_window: 1048576,
+		reasoning: true,
+		multimodal: true,
+		pricing: { inputTokenPricePer1M: 4, outputTokenPricePer1M: 20 },
+	},
+	{
 		id: "kimi-k3",
 		name: "Kimi K3",
 		context_window: 262144,
