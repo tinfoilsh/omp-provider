@@ -45,7 +45,7 @@
 		"access": "public"
 	},
 	"dependencies": {
-		"tinfoil": "^1.2.1"
+		"tinfoil": "^2.0.0-rc.2"
 	},
 	"devDependencies": {
 		"@oh-my-pi/pi-ai": "18.4.2",

@@ -27,17 +27,17 @@ enclaves that even Tinfoil cannot read into.
 ## How verification works
 
 The plugin uses the [`tinfoil` SDK](https://github.com/tinfoilsh/tinfoil-js) to
-verify the inference enclave: it checks the enclave's attestation, confirms the
-running code against the release digest signed in Sigstore, and binds the
-attested key to the live connection. Every request body is then encrypted
-end-to-end with HPKE, so only the verified enclave can read it.
+verify the inference enclave: it checks the enclave's attestation document and
+confirms the running code against the release digest signed in Sigstore. Every
+connection is then pinned to the attested TLS key, so only the verified enclave
+can read your requests.
 
-Run `/tinfoil` at any time to verify again from scratch and print the verification
-document, with a per-step breakdown when a step failed.
+Run `/tinfoil` at any time to verify again and print what the verification
+proved. When it fails, the report names the check that rejected the enclave.
 
 The plugin also refuses to send requests while `PI_REQ_DEBUG=1`. That setting
-makes omp write request bodies to disk, and omp records them before this plugin
-encrypts them. Unset the variable, or set `TINFOIL_ALLOW_REQ_DEBUG=1` to accept
+makes omp write request bodies to disk, and omp records them before they are
+encrypted. Unset the variable, or set `TINFOIL_ALLOW_REQ_DEBUG=1` to accept
 plaintext prompt logs and continue.
 
 | Variable | Default | Purpose |
