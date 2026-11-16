@@ -417,16 +417,20 @@ export default function (pi: ExtensionAPI) {
 	const envApiKey = (): string | undefined => process.env[API_KEY_ENV]?.trim() || undefined;
 
 	/**
-	 * Origin only — the placeholder's `/v1` path is kept, and `client.baseURL` is the
-	 * router's root. The SDK still refuses any origin but the verified enclave, so a
-	 * bad rewrite fails closed.
+	 * Scheme and host only, so nothing in the path can move the request elsewhere;
+	 * the placeholder's `/v1` path is kept, and `client.baseURL` is the router's
+	 * root. The SDK still refuses any origin but the verified enclave, so a bad
+	 * rewrite fails closed.
 	 */
 	const toEnclave = (input: RequestInfo | URL, base: string): RequestInfo | URL => {
 		const swap = (raw: string): string => {
 			// The SDK's fetch takes only absolute URLs; resolve any relative path here.
 			const url = new URL(raw, base);
 			if (url.origin !== PLACEHOLDER_ORIGIN) return url.toString();
-			return new URL(url.pathname + url.search + url.hash, base).toString();
+			const enclave = new URL(base);
+			url.protocol = enclave.protocol;
+			url.host = enclave.host;
+			return url.toString();
 		};
 
 		if (typeof input === "string" || input instanceof URL) return swap(String(input));
