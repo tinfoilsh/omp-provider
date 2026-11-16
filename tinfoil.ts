@@ -83,11 +83,21 @@ type VerifyState =
 	| { kind: "failed"; reason: string };
 
 function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
+	const message = error instanceof Error ? error.message : String(error);
+	// The SDK retries verification once and appends the first attempt's error;
+	// drop it when both attempts failed the same way.
+	const attempts = /^(.*) \(first attempt: (.*)\)$/s.exec(message);
+	return attempts && attempts[1] === attempts[2] ? attempts[1] : message;
 }
 
+/** End a reason with a period, so the hint that follows it starts a new sentence. */
+function sentence(reason: string): string {
+	return /[.!?]$/.test(reason) ? reason : `${reason}.`;
+}
+
+/** Why requests are blocked, as a sentence. */
 function reasonOf(state: VerifyState): string {
-	return state.kind === "failed" ? state.reason : "verification did not run";
+	return sentence(state.kind === "failed" ? state.reason : "verification did not run");
 }
 
 /** Never resolves; rejects when `signal` aborts. */
@@ -280,8 +290,8 @@ function reportLines(
 	if (state.kind !== "verified" || !verification) {
 		const reason =
 			state.kind === "failed" ? state.reason : "no request has triggered verification yet in this session";
+		// No base URL: nothing was verified, so there is no enclave URL to show.
 		return [
-			`Base URL:   ${baseUrl}`,
 			`Credential: ${credentialSource(envKey)}`,
 			`Reason:     ${reason}`,
 			"",
@@ -630,7 +640,7 @@ export default function (pi: ExtensionAPI) {
 		if (state.kind === "failed") {
 			return {
 				message:
-					`Tinfoil: enclave verification failed: ${state.reason} ` +
+					`Tinfoil: enclave verification failed: ${reasonOf(state)} ` +
 					`Requests are blocked. Run /tinfoil for the full report. See ${HELP_URL}`,
 				level: "error",
 			};
