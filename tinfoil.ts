@@ -12,16 +12,18 @@ import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-comple
 import { applyModelPatch } from "@oh-my-pi/pi-coding-agent/config/model-patch";
 import type { ExtensionAPI, ProviderModelConfig } from "@oh-my-pi/pi-coding-agent";
 // Resolves from this package's node_modules: omp does not rewrite this specifier.
-import { SecureClient, type VerificationDocument } from "tinfoil";
+import { RouterHTTPClient } from "tinfoil";
+
+/** What a successful verification proves; the SDK re-exports it only as `current`. */
+type Verification = NonNullable<RouterHTTPClient["current"]>;
 
 /**
  * Tinfoil provider for the omp coding agent.
  *
- * Attestation and encryption happen in-process via the `tinfoil` SDK: it
- * verifies the SEV-SNP report against a pinned AMD root key (ARK to ASK to
- * VCEK, plus the report signature), checks the Sigstore-signed code digest,
- * and encrypts every request body end-to-end with HPKE. It does not check
- * certificate revocation and covers SEV-SNP only.
+ * Attestation happens in-process via the `tinfoil` SDK: it verifies the
+ * enclave's attestation document (the hardware quote, the Sigstore-signed code
+ * release, and freshness) and pins every connection to the attested TLS key,
+ * so only the verified enclave can read a request.
  *
  * See README.md for setup.
  */
@@ -61,25 +63,23 @@ const REQ_DEBUG_OVERRIDE_ENV = "TINFOIL_ALLOW_REQ_DEBUG";
 
 const DISCOVER_TIMEOUT_MS = 8000;
 
-/** Attestation has no timeout of its own, so an unreachable endpoint would hang the turn forever. */
+/** Router discovery alone may try for 30s before falling back; bound the whole attempt. */
 const ATTEST_TIMEOUT_MS = 30_000;
 
 const RETRY_COOLDOWN_MS = 30_000;
-
-// Drift is a warning, not a failure: the attestation behind the fields still holds.
-const KNOWN_SCHEMA_VERSION = 1;
 
 // =============================================================================
 // Verification state
 // =============================================================================
 
 /**
- * Anything but "verified" blocks every request. No TTL: verification binds to the
- * live connection and `SecureClient.fetch` re-attests when the enclave rotates keys.
+ * Anything but "verified" blocks every request. No TTL: a client only exists once
+ * verified, and its `fetch` verifies again when the verification expires or the
+ * enclave rotates keys.
  */
 type VerifyState =
 	| { kind: "unverified" }
-	| { kind: "verified" }
+	| { kind: "verified"; client: RouterHTTPClient }
 	| { kind: "failed"; reason: string };
 
 function errorMessage(error: unknown): string {
@@ -98,21 +98,6 @@ function aborted(signal: AbortSignal | null | undefined): Promise<never> {
 		if (signal.aborted) return fail();
 		signal.addEventListener("abort", fail, { once: true });
 	});
-}
-
-/** Reject if `work` outlasts `ms`. The underlying work is not cancellable. */
-async function withDeadline<T>(work: Promise<T>, ms: number, label: string): Promise<T> {
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	try {
-		return await Promise.race([
-			work,
-			new Promise<never>((_, reject) => {
-				timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
-			}),
-		]);
-	} finally {
-		if (timer) clearTimeout(timer);
-	}
 }
 
 // =============================================================================
@@ -256,33 +241,29 @@ const markToken = (state: VerifyState) => MARKS[state.kind].token;
 
 
 
-function summaryParts(state: VerifyState, document?: VerificationDocument): { verdict: string; detail: string } {
-	if (state.kind === "verified") return { verdict: "Tinfoil verified", detail: shortHash(document?.releaseDigest) };
+function summaryParts(state: VerifyState, verification?: Verification): { verdict: string; detail: string } {
+	if (state.kind === "verified") return { verdict: "Tinfoil verified", detail: shortHash(verification?.codeDigest) };
 	if (state.kind === "failed") return { verdict: "Tinfoil unverified", detail: "" };
 	return { verdict: "Tinfoil verifying", detail: "" };
 }
 
-function summary(state: VerifyState, document?: VerificationDocument): string {
-	const { verdict, detail } = summaryParts(state, document);
+function summary(state: VerifyState, verification?: Verification): string {
+	const { verdict, detail } = summaryParts(state, verification);
 	return [verdict, mark(state), detail].filter(Boolean).join(" ");
 }
 
-/** Ordered as the verifier performs the steps. */
-function stepLines(document: VerificationDocument): string[] {
-	const steps = document.steps;
-	if (!steps) return [];
-	const entries: Array<[string, { status?: string; error?: string } | undefined]> = [
-		["Fetch digest", steps.fetchDigest],
-		["Verify code", steps.verifyCode],
-		["Verify enclave", steps.verifyEnclave],
-		["Compare measurements", steps.compareMeasurements],
-		["Verify certificate", steps.verifyCertificate],
-		["Other", steps.otherError],
+/** A measurement's set registers, one per line, labeled as the verifier names them. */
+function measurementLines(label: string, measurement: Record<string, string | undefined>): string[] {
+	const { platform, ...registers } = measurement;
+	return [
+		`  ${label.padEnd(17)}${platform ?? "unknown"}`,
+		...Object.entries(registers)
+			.filter((pair): pair is [string, string] => Boolean(pair[1]))
+			.map(([name, value]) => `    ${name.padEnd(15)}${value}`),
 	];
-	return entries.flatMap(([name, step]) =>
-		step ? [`  ${name.padEnd(22)}${step.status ?? "unknown"}${step.error ? `: ${step.error}` : ""}`] : [],
-	);
 }
+
+const timeOf = (value?: Date) => value?.toISOString() ?? "unknown";
 
 /** The environment silently outranks `/login`, so a surprise 401 needs attributing. */
 function credentialSource(envKey: string | undefined): string {
@@ -291,12 +272,12 @@ function credentialSource(envKey: string | undefined): string {
 
 function reportLines(
 	state: VerifyState,
-	document: VerificationDocument | undefined,
+	verification: Verification | undefined,
 	baseUrl: string,
 	models: number,
 	envKey: string | undefined,
 ): string[] {
-	if (state.kind !== "verified" || !document) {
+	if (state.kind !== "verified" || !verification) {
 		const reason =
 			state.kind === "failed" ? state.reason : "no request has triggered verification yet in this session";
 		return [
@@ -308,40 +289,34 @@ function reportLines(
 		];
 	}
 
-	const enclave = document.enclaveMeasurement ?? {};
+	// The JSON form renders registers as hex and drops facts that were not established.
+	const facts = verification.toJSON();
 	return [
 		"Connection",
 		`  Base URL:        ${baseUrl}`,
-		`  Enclave host:    ${document.enclaveHost || "unknown"}`,
-		`  Router endpoint: ${document.selectedRouterEndpoint || "unknown"}`,
-		`  Config repo:     ${document.configRepo || "unknown"}`,
+		`  Enclave host:    ${state.client.enclave || "unknown"}`,
+		`  Config repo:     ${facts.configRepo || "unknown"}`,
 		`  Models:          ${models}`,
 		`  Credential:      ${credentialSource(envKey)}`,
 		"",
 		"Release",
-		`  Tag:             ${document.releaseTag ?? "unknown"}`,
-		`  Digest:          ${document.releaseDigest || "unknown"}`,
-		`  Code print:      ${document.codeFingerprint || "unknown"}`,
-		`  Enclave print:   ${document.enclaveFingerprint || "unknown"}`,
+		`  Tag:             ${facts.codeTag || "unknown"}`,
+		`  Digest:          ${facts.codeDigest || "unknown"}`,
+		...(facts.runtime ? [`  Runtime:         ${facts.runtime.repo}@${facts.runtime.tag} (${shortHash(facts.runtime.digest)})`] : []),
+		...(facts.config ? [`  Config:          ${facts.config.name || "unnamed"} (${shortHash(facts.config.digest)})`] : []),
 		"",
 		"Attested keys",
-		`  TLS public key:  ${document.tlsPublicKey || "unknown"}`,
-		`  TLS fingerprint: ${enclave.tlsPublicKeyFingerprint ?? "unknown"}`,
-		`  HPKE public key: ${document.hpkePublicKey || enclave.hpkePublicKey || "unknown"}`,
+		`  TLS fingerprint: ${verification.tlsPublicKeyFP ?? "unknown"}`,
+		`  HPKE public key: ${verification.hpkePublicKey ?? "unknown"}`,
 		"",
 		"Measurements",
-		`  Code:            ${document.codeMeasurement?.type || "unknown"}`,
-		...(document.codeMeasurement?.registers ?? []).map((register) => `                   ${register}`),
-		`  Enclave:         ${enclave.measurement?.type ?? "unknown"}`,
-		...(enclave.measurement?.registers ?? []).map((register) => `                   ${register}`),
-		"",
-		"Verification steps",
-		...stepLines(document),
+		...measurementLines("Code:", facts.codeMeasurement),
+		...measurementLines("Enclave:", facts.enclaveMeasurement),
 		"",
 		"Verifier",
-		`  Verifier:        ${document.verifier?.name ?? "unknown"} ${document.verifier?.version ?? ""}`.trimEnd(),
-		`  Verified:        ${document.securityVerified === true ? "yes" : "(SDK did not mark this document verified)"}`,
-		`  Verified at:     ${document.verifiedAt ?? "unknown"}`,
+		`  Verifier:        ${facts.metadata.verifier.name} ${facts.metadata.verifier.version}`,
+		`  Verified at:     ${timeOf(verification.metadata.verifiedAt)}`,
+		`  Fresh until:     ${verification.freshnessExpiresAt ? timeOf(verification.freshnessExpiresAt) : "no expiry"}`,
 	];
 }
 
@@ -350,8 +325,9 @@ function reportLines(
 // =============================================================================
 
 export default function (pi: ExtensionAPI) {
-	// Constructor does no network, so a startup outage cannot stop omp loading.
-	const secureClient = new SecureClient();
+	// Created on first use, so a startup outage cannot stop omp loading. A client
+	// only exists once its router has verified.
+	let client: RouterHTTPClient | undefined;
 
 	let state: VerifyState = { kind: "unverified" };
 	let inFlight: Promise<VerifyState> | undefined;
@@ -360,19 +336,43 @@ export default function (pi: ExtensionAPI) {
 	/** Bumped on every forced re-verification, to retire superseded attempts. */
 	let epoch = 0;
 
+	/**
+	 * Re-verifies the router we have; if it no longer verifies, discovers again,
+	 * which may pick a different router. Never touches `client`: only the
+	 * attempt that wins the epoch may install its result.
+	 */
 	const attempt = async (): Promise<VerifyState> => {
+		const signal = AbortSignal.timeout(ATTEST_TIMEOUT_MS);
 		try {
-			await withDeadline(secureClient.ready(), ATTEST_TIMEOUT_MS, "enclave verification");
-			return { kind: "verified" };
+			if (client) {
+				const existing = client;
+				try {
+					await existing.reverify({ signal });
+					return { kind: "verified", client: existing };
+				} catch (error) {
+					if (signal.aborted) throw error;
+				}
+			}
+			return { kind: "verified", client: await RouterHTTPClient.create({ signal }) };
 		} catch (error) {
-			return { kind: "failed", reason: errorMessage(error) };
+			const reason = signal.aborted
+				? `enclave verification timed out after ${ATTEST_TIMEOUT_MS}ms`
+				: errorMessage(error);
+			return { kind: "failed", reason };
 		}
+	};
+
+	/** Installs a verified client, closing the one it replaces (which failed to verify). */
+	const adopt = (next: VerifyState) => {
+		if (next.kind !== "verified" || next.client === client) return;
+		const previous = client;
+		client = next.client;
+		void previous?.close();
 	};
 
 	/** Concurrent callers share one attempt; failures are cached for the cooldown. */
 	const ensureVerified = async (force = false): Promise<VerifyState> => {
 		if (force) {
-			secureClient.reset();
 			state = { kind: "unverified" };
 			inFlight = undefined;
 			epoch += 1;
@@ -386,7 +386,13 @@ export default function (pi: ExtensionAPI) {
 		// land after a newer failure and re-open the guard.
 		const mine = epoch;
 		inFlight = attempt().then((next) => {
-			if (mine !== epoch) return next;
+			if (mine !== epoch) {
+				// Superseded: a client this attempt discovered is nobody's to use, so
+				// close it and hand callers the newer attempt's result instead.
+				if (next.kind === "verified" && next.client !== client) void next.client.close();
+				return inFlight ?? state;
+			}
+			adopt(next);
 			state = next;
 			lastAttemptAt = Date.now();
 			inFlight = undefined;
@@ -401,22 +407,15 @@ export default function (pi: ExtensionAPI) {
 	const envApiKey = (): string | undefined => process.env[API_KEY_ENV]?.trim() || undefined;
 
 	/**
-	 * Origin only — the placeholder and `getBaseURL()` share the `/v1` path. The SDK
-	 * still refuses any origin but the verified enclave, so a bad rewrite fails closed.
+	 * Origin only — the placeholder's `/v1` path is kept, and `client.baseURL` is the
+	 * router's root. The SDK still refuses any origin but the verified enclave, so a
+	 * bad rewrite fails closed.
 	 */
-	const toEnclave = (input: RequestInfo | URL): RequestInfo | URL => {
-		const base = secureClient.getBaseURL();
-		if (!base) return input;
-
+	const toEnclave = (input: RequestInfo | URL, base: string): RequestInfo | URL => {
 		const swap = (raw: string): string => {
-			let url: URL;
-			try {
-				url = new URL(raw);
-			} catch {
-				// Relative path: the SDK resolves it against the enclave itself.
-				return raw;
-			}
-			if (url.origin !== PLACEHOLDER_ORIGIN) return raw;
+			// The SDK's fetch takes only absolute URLs; resolve any relative path here.
+			const url = new URL(raw, base);
+			if (url.origin !== PLACEHOLDER_ORIGIN) return url.toString();
 			return new URL(url.pathname + url.search + url.hash, base).toString();
 		};
 
@@ -441,7 +440,11 @@ export default function (pi: ExtensionAPI) {
 			);
 		}
 
-		// Attestation is not cancellable, so race the signal or Ctrl-C does nothing.
+		// Taken before verifying, so a forced re-verification that lands while this
+		// request waits still counts as one that may have closed its client.
+		const mine = epoch;
+		// Attempts are shared between callers, so race this caller's signal rather
+		// than aborting an attempt others are waiting on.
 		const current = await Promise.race([ensureVerified(), aborted(init?.signal)]);
 		if (current.kind !== "verified") {
 			throw new Error(
@@ -450,17 +453,17 @@ export default function (pi: ExtensionAPI) {
 			);
 		}
 
-		const send = () => secureClient.fetch(toEnclave(input), init);
-		const mine = epoch;
+		const send = (verified: RouterHTTPClient) => verified.fetch(toEnclave(input, verified.baseURL), init);
 		try {
-			return await send();
+			return await send(current.client);
 		} catch (error) {
-			// A forced re-verification resets the transport mid-flight; retry once so
-			// /tinfoil cannot kill an in-flight turn.
-			if (mine === epoch) throw error;
-			const retry = await ensureVerified();
+			// A forced re-verification may replace and close the client mid-flight;
+			// retry once so /tinfoil cannot kill an in-flight turn. Not after the
+			// caller gave up, though.
+			if (mine === epoch || init?.signal?.aborted) throw error;
+			const retry = await Promise.race([ensureVerified(), aborted(init?.signal)]);
 			if (retry.kind !== "verified") throw error;
-			return await send();
+			return await send(retry.client);
 		}
 	};
 
@@ -494,7 +497,7 @@ export default function (pi: ExtensionAPI) {
 	const discoverModels = async (apiKey?: string): Promise<ProviderModelConfig[]> => {
 		if (!apiKey) return FALLBACK_CATALOG.map(toModelConfig);
 
-		const response = await guardedFetch("/v1/models", {
+		const response = await guardedFetch(`${PLACEHOLDER_BASE_URL}/models`, {
 			headers: { Authorization: `Bearer ${apiKey}` },
 			signal: AbortSignal.timeout(DISCOVER_TIMEOUT_MS),
 		});
@@ -586,19 +589,10 @@ export default function (pi: ExtensionAPI) {
 
 	const usesTinfoil = (ctx: StatusContext) => ctx.model?.provider === PROVIDER_ID;
 
-	/**
-	 * Read at render time so a self-recovered rotation shows up. Returned even on
-	 * failure: the partial document's per-step errors are the point of /tinfoil.
-	 */
-	const documentOf = (): VerificationDocument | undefined => {
-		try {
-			return secureClient.getVerificationDocument();
-		} catch {
-			return undefined;
-		}
-	};
+	/** Read at render time so a self-recovered rotation shows up. */
+	const verificationOf = (): Verification | undefined => (state.kind === "verified" ? state.client.current : undefined);
 
-	const baseUrlOf = (): string => secureClient.getBaseURL() ?? PLACEHOLDER_BASE_URL;
+	const baseUrlOf = (): string => (state.kind === "verified" ? `${state.client.baseURL}v1` : PLACEHOLDER_BASE_URL);
 
 	/**
 	 * Hidden unless Tinfoil is active, or it claims a guarantee that does not apply.
@@ -612,7 +606,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const { verdict, detail } = summaryParts(state, documentOf());
+		const { verdict, detail } = summaryParts(state, verificationOf());
 		const line = [
 			theme.fg(markToken(state), mark(state)),
 			theme.fg("dim", verdict),
@@ -622,16 +616,6 @@ export default function (pi: ExtensionAPI) {
 			.join(" ");
 
 		ctx.ui.setWidget(PROVIDER_ID, [line], { placement: "belowEditor" });
-	};
-
-	// Warn (do not fail) if the document layout drifts ahead of this extension.
-	const schemaNote = (): string | undefined => {
-		if (state.kind !== "verified") return undefined;
-		const version = secureClient.getVerificationDocument().schemaVersion;
-		return version === KNOWN_SCHEMA_VERSION
-			? undefined
-			: `the SDK reports document schema ${version ?? "(none)"}, and this extension knows ${KNOWN_SCHEMA_VERSION}. ` +
-					`Some fields in /tinfoil may read as "unknown". Update the extension.`;
 	};
 
 	const warning = (): { message: string; level: "warning" | "error" } | undefined => {
@@ -651,8 +635,6 @@ export default function (pi: ExtensionAPI) {
 				level: "error",
 			};
 		}
-		const note = schemaNote();
-		if (note) return { message: `Tinfoil: ${note}`, level: "warning" };
 		return undefined;
 	};
 
@@ -661,10 +643,10 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			await ensureVerified(true);
 
-			const document = documentOf();
+			const verification = verificationOf();
 			const trusted = state.kind === "verified";
-			const lines = reportLines(state, document, baseUrlOf(), modelCount, envApiKey());
-			const head = summary(state, document);
+			const lines = reportLines(state, verification, baseUrlOf(), modelCount, envApiKey());
+			const head = summary(state, verification);
 
 			showStatus(ctx);
 			// Notify, not a transcript message: omp turns every custom message into a
