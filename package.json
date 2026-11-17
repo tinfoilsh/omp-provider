@@ -1,6 +1,6 @@
 {
 	"name": "@tinfoilsh/omp-provider",
-	"version": "0.1.2",
+	"version": "0.2.0",
 	"description": "Verifiably-private models from Tinfoil secure enclaves, for the omp coding agent",
 	"type": "module",
 	"license": "Apache-2.0",
