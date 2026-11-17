@@ -175,9 +175,17 @@ function isUsable(raw: TinfoilApiModel): boolean {
  * Load-bearing: when discovery fails the provider would otherwise have no models,
  * and omp then points the user at other providers. Stale entries are safe; the
  * guard blocks every request until verification passes.
- * Snapshot of https://inference.tinfoil.sh/v1/models, 2026-09; refresh on release.
+ * Snapshot of https://inference.tinfoil.sh/v1/models, 2026-11; refresh on release.
  */
 const FALLBACK_CATALOG: TinfoilApiModel[] = [
+	{
+		id: "deepseek-v4-1-flash",
+		name: "DeepSeek V4.1 Flash",
+		context_window: 1048576,
+		reasoning: true,
+		multimodal: true,
+		pricing: { inputTokenPricePer1M: 0.6, outputTokenPricePer1M: 1.45 },
+	},
 	{
 		id: "glm-5-3",
 		name: "GLM-5.3",
@@ -186,24 +194,16 @@ const FALLBACK_CATALOG: TinfoilApiModel[] = [
 		pricing: { inputTokenPricePer1M: 1.8, outputTokenPricePer1M: 5.75 },
 	},
 	{
-		id: "glm-5-3-flash",
-		name: "GLM-5.3 Flash",
-		context_window: 1048576,
+		id: "inkling-2-small",
+		name: "Inkling 2 Small",
+		context_window: 524288,
 		reasoning: true,
 		multimodal: true,
-		pricing: { inputTokenPricePer1M: 0.4, outputTokenPricePer1M: 1.25 },
+		pricing: { inputTokenPricePer1M: 0.3, outputTokenPricePer1M: 1 },
 	},
 	{
-		id: "deepseek-v4-1-flash",
-		name: "DeepSeek V4.1 Flash",
-		context_window: 1048576,
-		reasoning: true,
-		multimodal: true,
-		pricing: { inputTokenPricePer1M: 0.65, outputTokenPricePer1M: 1.45 },
-	},
-	{
-		id: "kimi-k3",
-		name: "Kimi K3",
+		id: "kimi-k3-1-pro",
+		name: "Kimi K3.1 Pro",
 		context_window: 262144,
 		reasoning: true,
 		multimodal: true,
