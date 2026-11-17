@@ -61,7 +61,11 @@ const REQ_DEBUG_ENV = "PI_REQ_DEBUG";
 /** Opt back in to that dump, prompts in the clear, for debugging this provider. */
 const REQ_DEBUG_OVERRIDE_ENV = "TINFOIL_ALLOW_REQ_DEBUG";
 
-const DISCOVER_TIMEOUT_MS = 8000;
+/**
+ * Covers enclave verification as well as the request. Stays under omp's 15 s limit
+ * on model discovery, past which omp would discard the fallback too.
+ */
+const DISCOVER_TIMEOUT_MS = 12_000;
 
 /** Router discovery alone may try for 30s before falling back; bound the whole attempt. */
 const ATTEST_TIMEOUT_MS = 30_000;
@@ -168,9 +172,9 @@ function isUsable(raw: TinfoilApiModel): boolean {
 }
 
 /**
- * Load-bearing: on a cold cache a discovery failure would otherwise leave the
- * provider with no models, and omp then points the user at other providers.
- * Stale entries are safe; the guard blocks every request until verification passes.
+ * Load-bearing: when discovery fails the provider would otherwise have no models,
+ * and omp then points the user at other providers. Stale entries are safe; the
+ * guard blocks every request until verification passes.
  * Snapshot of https://inference.tinfoil.sh/v1/models, 2026-09; refresh on release.
  */
 const FALLBACK_CATALOG: TinfoilApiModel[] = [
@@ -284,7 +288,7 @@ function reportLines(
 	state: VerifyState,
 	verification: Verification | undefined,
 	baseUrl: string,
-	models: number,
+	models: string,
 	envKey: string | undefined,
 ): string[] {
 	if (state.kind !== "verified" || !verification) {
@@ -342,7 +346,8 @@ export default function (pi: ExtensionAPI) {
 	let state: VerifyState = { kind: "unverified" };
 	let inFlight: Promise<VerifyState> | undefined;
 	let lastAttemptAt = 0;
-	let modelCount = FALLBACK_CATALOG.length;
+	/** What the last discovery in this session found; omp serves its cache without one. */
+	let modelSummary = "no discovery yet this session (omp's cached list)";
 	/** Bumped on every forced re-verification, to retire superseded attempts. */
 	let epoch = 0;
 
@@ -504,22 +509,45 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
-	 * Throwing leaves omp on the static catalog. omp runs this at session start
-	 * whatever the active model, so skip it without a key: otherwise installing the
-	 * plugin would attest for people who never select a Tinfoil model.
+	 * The only source of models: omp adds statically registered models to the live
+	 * list rather than replacing them, so a static catalog would keep offering
+	 * models Tinfoil has retired. Without a key, or when discovery fails or comes
+	 * back empty, return the fallback catalog instead.
+	 *
+	 * omp runs this at session start whatever the active model, so skip it without
+	 * a key: otherwise installing the plugin would attest for people who never
+	 * select a Tinfoil model.
+	 *
+	 * omp caches whatever this returns for a day, the fallback included, and calls
+	 * it again only once that expires or the user refreshes the model list. A failed
+	 * discovery therefore shows the fallback until then; refreshing once Tinfoil is
+	 * reachable brings the live list back. A rejected key gets the fallback too:
+	 * omp only reports a key rejection for its own error type, and an empty list
+	 * would send the user to other providers. The key fails on first use instead.
 	 */
 	const discoverModels = async (apiKey?: string): Promise<ProviderModelConfig[]> => {
-		if (!apiKey) return FALLBACK_CATALOG.map(toModelConfig);
+		const fallback = (why: string) => {
+			modelSummary = `${FALLBACK_CATALOG.length} (fallback catalog: ${why})`;
+			return FALLBACK_CATALOG.map(toModelConfig);
+		};
+		if (!apiKey) return fallback("no API key");
 
-		const response = await guardedFetch(`${PLACEHOLDER_BASE_URL}/models`, {
-			headers: { Authorization: `Bearer ${apiKey}` },
-			signal: AbortSignal.timeout(DISCOVER_TIMEOUT_MS),
-		});
-		if (!response.ok) throw new Error(`HTTP ${response.status} from /v1/models`);
-		const body = (await response.json()) as { data?: TinfoilApiModel[] };
-		const models = (body.data ?? []).filter(isUsable).map(toModelConfig);
-		modelCount = models.length;
-		return models;
+		try {
+			const response = await guardedFetch(`${PLACEHOLDER_BASE_URL}/models`, {
+				headers: { Authorization: `Bearer ${apiKey}` },
+				signal: AbortSignal.timeout(DISCOVER_TIMEOUT_MS),
+			});
+			if (!response.ok) return fallback(`HTTP ${response.status} from /v1/models`);
+			const body = (await response.json()) as { data?: TinfoilApiModel[] };
+			const models = (body.data ?? []).filter(isUsable).map(toModelConfig);
+			if (models.length === 0) return fallback("no usable models listed");
+			modelSummary = `${models.length} (live)`;
+			return models;
+		} catch (error) {
+			// The guard refuses requests on its own while verification fails, and
+			// /tinfoil reports why; a usable picker is all this has to keep.
+			return fallback(errorMessage(error));
+		}
 	};
 
 	pi.registerProvider(PROVIDER_ID, {
@@ -533,7 +561,6 @@ export default function (pi: ExtensionAPI) {
 		 */
 		...(envApiKey() ? { apiKey: API_KEY_ENV } : {}),
 		authHeader: true,
-		models: FALLBACK_CATALOG.map(toModelConfig),
 		fetchDynamicModels: discoverModels,
 		/**
 		 * Tinfoil issues long-lived keys, so returning a bare string tells omp to store
@@ -660,7 +687,7 @@ export default function (pi: ExtensionAPI) {
 
 			const verification = verificationOf();
 			const trusted = state.kind === "verified";
-			const lines = reportLines(state, verification, baseUrlOf(), modelCount, envApiKey());
+			const lines = reportLines(state, verification, baseUrlOf(), modelSummary, envApiKey());
 			const head = summary(state, verification);
 
 			showStatus(ctx);
