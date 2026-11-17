@@ -629,7 +629,8 @@ export default function (pi: ExtensionAPI) {
 			.filter(Boolean)
 			.join(" ");
 
-		ctx.ui.setWidget(PROVIDER_ID, [line], { placement: "belowEditor" });
+		// Above the editor, right on top of omp's status line, so it reads as part of it.
+		ctx.ui.setWidget(PROVIDER_ID, [line], { placement: "aboveEditor" });
 	};
 
 	const warning = (): { message: string; level: "warning" | "error" } | undefined => {
