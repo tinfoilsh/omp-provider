@@ -14,8 +14,8 @@ import type { ExtensionAPI, ProviderModelConfig } from "@oh-my-pi/pi-coding-agen
 // Resolves from this package's node_modules: omp does not rewrite this specifier.
 import { RouterHTTPClient } from "tinfoil";
 
-/** What a successful verification proves; the SDK re-exports it only as `current`. */
-type Verification = NonNullable<RouterHTTPClient["current"]>;
+/** The report of the verification the client relies on; the SDK exposes it only through `currentVerification()`. */
+type Verification = NonNullable<ReturnType<RouterHTTPClient["currentVerification"]>>;
 
 /**
  * Tinfoil provider for the omp coding agent.
@@ -256,7 +256,7 @@ const markToken = (state: VerifyState) => MARKS[state.kind].token;
 
 
 function summaryParts(state: VerifyState, verification?: Verification): { verdict: string; detail: string } {
-	if (state.kind === "verified") return { verdict: "Tinfoil verified", detail: shortHash(verification?.codeDigest) };
+	if (state.kind === "verified") return { verdict: "Tinfoil verified", detail: shortHash(verification?.verifiedFacts?.codeDigest) };
 	if (state.kind === "failed") return { verdict: "Tinfoil unverified", detail: "" };
 	return { verdict: "Tinfoil verifying", detail: "" };
 }
@@ -291,7 +291,8 @@ function reportLines(
 	models: string,
 	envKey: string | undefined,
 ): string[] {
-	if (state.kind !== "verified" || !verification) {
+	const verified = verification?.verifiedFacts;
+	if (state.kind !== "verified" || !verification || !verified) {
 		const reason =
 			state.kind === "failed" ? state.reason : "no request has triggered verification yet in this session";
 		// No base URL: nothing was verified, so there is no enclave URL to show.
@@ -304,33 +305,33 @@ function reportLines(
 	}
 
 	// The JSON form renders registers as hex and drops facts that were not established.
-	const facts = verification.toJSON();
+	const facts = verified.toJSON();
 	return [
 		"Connection",
 		`  Base URL:        ${baseUrl}`,
 		`  Enclave host:    ${state.client.enclave || "unknown"}`,
-		`  Config repo:     ${facts.configRepo || "unknown"}`,
+		`  Config repo:     ${facts.config_repo || "unknown"}`,
 		`  Models:          ${models}`,
 		`  Credential:      ${credentialSource(envKey)}`,
 		"",
 		"Release",
-		`  Tag:             ${facts.codeTag || "unknown"}`,
-		`  Digest:          ${facts.codeDigest || "unknown"}`,
+		`  Tag:             ${facts.code_tag || "unknown"}`,
+		`  Digest:          ${facts.code_digest || "unknown"}`,
 		...(facts.runtime ? [`  Runtime:         ${facts.runtime.repo}@${facts.runtime.tag} (${shortHash(facts.runtime.digest)})`] : []),
 		...(facts.config ? [`  Config:          ${facts.config.name || "unnamed"} (${shortHash(facts.config.digest)})`] : []),
 		"",
 		"Attested keys",
-		`  TLS fingerprint: ${verification.tlsPublicKeyFP ?? "unknown"}`,
-		`  HPKE public key: ${verification.hpkePublicKey ?? "unknown"}`,
+		`  TLS fingerprint: ${verified.tlsPublicKeyFP ?? "unknown"}`,
+		`  HPKE public key: ${verified.hpkePublicKey ?? "unknown"}`,
 		"",
 		"Measurements",
-		...measurementLines("Code:", facts.codeMeasurement),
-		...measurementLines("Enclave:", facts.enclaveMeasurement),
+		...(facts.code_measurement ? measurementLines("Code:", facts.code_measurement) : []),
+		...measurementLines("Enclave:", facts.enclave_measurement),
 		"",
 		"Verifier",
-		`  Verifier:        ${facts.metadata.verifier.name} ${facts.metadata.verifier.version}`,
+		`  Verifier:        ${verification.metadata.verifier.name} ${verification.metadata.verifier.version}`,
 		`  Verified at:     ${timeOf(verification.metadata.verifiedAt)}`,
-		`  Fresh until:     ${verification.freshnessExpiresAt ? timeOf(verification.freshnessExpiresAt) : "no expiry"}`,
+		`  Fresh until:     ${verified.freshnessExpiresAt ? timeOf(verified.freshnessExpiresAt) : "no expiry"}`,
 	];
 }
 
@@ -631,7 +632,7 @@ export default function (pi: ExtensionAPI) {
 	const usesTinfoil = (ctx: StatusContext) => ctx.model?.provider === PROVIDER_ID;
 
 	/** Read at render time so a self-recovered rotation shows up. */
-	const verificationOf = (): Verification | undefined => (state.kind === "verified" ? state.client.current : undefined);
+	const verificationOf = (): Verification | undefined => (state.kind === "verified" ? state.client.currentVerification() : undefined);
 
 	const baseUrlOf = (): string => (state.kind === "verified" ? `${state.client.baseURL}v1` : PLACEHOLDER_BASE_URL);
 
