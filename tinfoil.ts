@@ -631,8 +631,16 @@ export default function (pi: ExtensionAPI) {
 
 	const usesTinfoil = (ctx: StatusContext) => ctx.model?.provider === PROVIDER_ID;
 
-	/** Read at render time so a self-recovered rotation shows up. */
-	const verificationOf = (): Verification | undefined => (state.kind === "verified" ? state.client.currentVerification() : undefined);
+	// Read at render time so a self-recovered rotation shows up. The SDK drops
+	// its report once the verification expires, until the next request
+	// verifies again; show the last one meanwhile.
+	const lastReports = new WeakMap<RouterHTTPClient, Verification>();
+	const verificationOf = (): Verification | undefined => {
+		if (state.kind !== "verified") return undefined;
+		const report = state.client.currentVerification();
+		if (report) lastReports.set(state.client, report);
+		return report ?? lastReports.get(state.client);
+	};
 
 	const baseUrlOf = (): string => (state.kind === "verified" ? `${state.client.baseURL}v1` : PLACEHOLDER_BASE_URL);
 
